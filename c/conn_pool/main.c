@@ -1,9 +1,11 @@
-#include "thread_pool.h"
 #include <limits.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <stdlib.h>
+
+#include "thread_pool.h"
 
 void *worker(void *user_data)
 {
@@ -16,46 +18,52 @@ void *worker(void *user_data)
 	}
 
 	while (1) {
+		// printf("thread: %lu -- waiting to get conn\n",
+		//        (unsigned long)t_id);
 		val = thread_pool_get_conn(pool);
+		// printf("thread: %lu -- got fd: %d\n", (unsigned long)t_id, val);
 
 		if (!thread_pool_get_should_run(pool)) {
 			break;
 		}
 
-		if (val != INT_MIN) {
-			printf("hello from thread %lu -- val is: %d\n",
-			       (unsigned long)t_id, val);
-		}
+		usleep(500);
+
+		// if (val != INT_MIN) {
+		// 	printf("thread: %lu -- got fd: %d\n",
+		// 	       (unsigned long)t_id, val);
+		// }
 	}
 
-	printf("finished thread %lu\n", (unsigned long)t_id);
+	// printf("thread: %lu -- finished\n", (unsigned long)t_id);
 
 	return NULL;
 }
 
-int main(void)
+int main(int argc, char **argv)
 {
-	thread_pool_t *pool = thread_pool_create(3, worker);
+	int workers = atoi(argv[1]);
+	printf("using %d workers\n", workers);
+	thread_pool_t *pool = thread_pool_create(workers, worker);
 
 	if (!pool) {
 		goto out;
 	}
 
-	// printf("main: sleeping for 40\n");
-
-	for (int i = 0; i < 27; i++) {
-		printf("main: pushing %d\n", i);
+	for (int i = 0; i < 10000; i++) {
+		// printf("thread: main -- pushing fd %d\n", i);
 		thread_pool_push_conn(pool, i);
 	}
 
-	while (pool->queue->list->size > 0) {
-		sleep(5);
+	// printf("thread: main -- cleaning up\n");
+
+	while (thread_pool_get_size(pool) > 0) {
+		usleep(1000);
 	}
-	printf("main: cleaning up\n");
-	// thread_pool_set_should_run(pool, 0);
 
 out:
 	thread_pool_destroy(pool);
+	printf("thread: main -- done\n");
 	// int sock = 0;
 	// int client_fd;
 	// struct sockaddr_in addr;

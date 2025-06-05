@@ -1,129 +1,194 @@
-#include "thread_queue.h"
 #include <limits.h>
+#include <pthread.h>
 #include <stdlib.h>
+#include <stdio.h>
 
+#include "queue.h"
 #include "thread_pool.h"
 
 thread_pool_t *thread_pool_create(size_t size, worker_func handler)
 {
 	int i;
-	thread_pool_t *tp = NULL;
+	thread_pool_t *pool = NULL;
 
-	tp = calloc(1, sizeof(thread_pool_t));
-	if (!tp) {
+	pool = calloc(1, sizeof(thread_pool_t));
+	if (!pool) {
 		return NULL;
 	}
 
-	tp->queue = thread_queue_create();
-	if (!tp->queue) {
+	pool->queue = queue_create();
+	if (!pool->queue) {
 		goto err;
 	}
 
-	if (pthread_rwlock_init(&tp->rw_lock, NULL) < 0) {
+	if (pthread_mutex_init(&pool->queue_mutex, NULL) < 0) {
 		goto err;
 	}
 
-	tp->should_run = 1;
-	tp->size = size;
-	tp->handler = handler;
-	tp->threads = calloc(size, sizeof(pthread_t));
+	if (pthread_cond_init(&pool->queue_cond, NULL) < 0) {
+		goto err;
+	}
 
-	if (!tp->threads) {
+	if (pthread_rwlock_init(&pool->should_run_rw_lock, NULL) < 0) {
+		goto err;
+	}
+
+	pool->should_run = 1;
+	pool->size = size;
+	pool->handler = handler;
+	pool->threads = calloc(size, sizeof(pthread_t));
+
+	if (!pool->threads) {
 		goto err;
 	}
 
 	for (i = 0; i < size; i++) {
-		if (pthread_create(&tp->threads[i], NULL, handler, tp) < 0) {
-			thread_pool_set_should_run(tp, 0);
+		if (pthread_create(&pool->threads[i], NULL, handler, pool) <
+		    0) {
+			thread_pool_set_should_run(pool, 0);
 
 			for (; i >= 0; i--) {
-				pthread_join(tp->threads[i], NULL);
+				pthread_join(pool->threads[i], NULL);
 			}
 
 			goto err;
 		}
 	}
 
-	return tp;
+	return pool;
 
 err:
-	if (tp) {
-		pthread_rwlock_destroy(&tp->rw_lock);
-		thread_queue_destroy(tp->queue);
-		free(tp->threads);
-		free(tp);
+	if (pool) {
+		pthread_mutex_destroy(&pool->queue_mutex);
+		pthread_cond_destroy(&pool->queue_cond);
+		pthread_rwlock_destroy(&pool->should_run_rw_lock);
+		queue_destroy(pool->queue);
+		free(pool->threads);
+		free(pool);
 	}
 
 	return NULL;
 }
 
-int thread_pool_get_should_run(thread_pool_t *tp)
+int thread_pool_get_should_run(thread_pool_t *pool)
 {
 	int should_run = 0;
 
-	if (!tp) {
+	if (!pool) {
 		return 0;
 	}
 
-	pthread_rwlock_rdlock(&tp->rw_lock);
-	should_run = tp->should_run;
-	pthread_rwlock_unlock(&tp->rw_lock);
+	pthread_rwlock_rdlock(&pool->should_run_rw_lock);
+	should_run = pool->should_run;
+	pthread_rwlock_unlock(&pool->should_run_rw_lock);
 
 	return should_run;
 }
 
-int thread_pool_set_should_run(thread_pool_t *tp, int value)
+int thread_pool_set_should_run(thread_pool_t *pool, int value)
 {
-	if (!tp) {
+	if (!pool) {
 		return -1;
 	}
 
-	pthread_rwlock_wrlock(&tp->rw_lock);
-	tp->should_run = value;
-	pthread_rwlock_unlock(&tp->rw_lock);
+	pthread_rwlock_wrlock(&pool->should_run_rw_lock);
+	pool->should_run = value;
+	pthread_rwlock_unlock(&pool->should_run_rw_lock);
 
 	return 0;
 }
 
-int thread_pool_get_conn(thread_pool_t *tp)
+int thread_pool_get_conn(thread_pool_t *pool)
 {
-	if (!tp || !tp->queue) {
+	int val;
+
+	if (!pool || !pool->queue) {
 		return INT_MIN;
 	}
 
-	return thread_queue_dequeue(tp->queue);
+	pthread_mutex_lock(&pool->queue_mutex);
+
+	while (queue_is_empty(pool->queue)) {
+		if (!thread_pool_get_should_run(pool)) {
+			goto out;
+		}
+
+		// printf("thread: %lu -- pthread_cond_wait\n",
+		//        (unsigned long)pthread_self());
+		pthread_cond_wait(&pool->queue_cond, &pool->queue_mutex);
+	}
+
+	val = queue_dequeue(pool->queue);
+
+out:
+	pthread_mutex_unlock(&pool->queue_mutex);
+
+	return val;
 }
 
-int thread_pool_push_conn(thread_pool_t *tp, int fd)
+int thread_pool_push_conn(thread_pool_t *pool, int fd)
 {
-	if (!tp || !tp->queue) {
+	int exit = 0;
+	if (!pool || !pool->queue) {
 		return -1;
 	}
 
-	return thread_queue_enqueue(tp->queue, fd);
+	pthread_mutex_lock(&pool->queue_mutex);
+	exit = queue_enqueue(pool->queue, fd);
+
+	pthread_cond_broadcast(&pool->queue_cond);
+
+	pthread_mutex_unlock(&pool->queue_mutex);
+
+	return exit;
 }
 
-void thread_pool_destroy(thread_pool_t *tp)
+size_t thread_pool_get_size(thread_pool_t *pool)
+{
+	size_t size;
+	if (!pool || !pool->queue) {
+		return 0;
+	}
+
+	pthread_mutex_lock(&pool->queue_mutex);
+	size = queue_size(pool->queue);
+	pthread_mutex_unlock(&pool->queue_mutex);
+
+	return size;
+}
+
+void thread_pool_destroy(thread_pool_t *pool)
 {
 	int i;
 
-	if (!tp || !tp->threads) {
+	if (!pool || !pool->threads) {
 		return;
 	}
 
-	thread_pool_set_should_run(tp, 0);
+	thread_pool_set_should_run(pool, 0);
 
-	if (tp->queue) {
-		pthread_cond_broadcast(&tp->queue->cond);
-		pthread_mutex_unlock(&tp->queue->mutex);
+	if (pool->queue) {
+		pthread_mutex_lock(&pool->queue_mutex);
+		pthread_cond_broadcast(&pool->queue_cond);
+		pthread_mutex_unlock(&pool->queue_mutex);
+		printf("broadcast on end\n");
 	}
 
-	for (i = 0; i < tp->size; i++) {
-		pthread_join(tp->threads[i], NULL);
+	for (i = 0; i < pool->size; i++) {
+		// printf("thread: main -- joining thread %lu\n",
+		//        (unsigned long)pool->threads[i]);
+		pthread_join(pool->threads[i], NULL);
+		// printf("thread: main -- joined thread %lu\n",
+		//        (unsigned long)pool->threads[i]);
 	}
 
-	thread_queue_destroy(tp->queue);
-	pthread_rwlock_destroy(&tp->rw_lock);
-	free(tp->threads);
-	free(tp);
+	if (pool->queue) {
+		queue_destroy(pool->queue);
+	}
+
+	pthread_mutex_destroy(&pool->queue_mutex);
+	pthread_cond_destroy(&pool->queue_cond);
+	pthread_rwlock_destroy(&pool->should_run_rw_lock);
+	free(pool->threads);
+	free(pool);
 }
